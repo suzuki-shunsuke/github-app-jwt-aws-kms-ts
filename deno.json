@@ -1,0 +1,16 @@
+{
+  "name": "@suzuki-shunsuke/github-app-jwt-aws-kms",
+  "tasks": {
+    "test": "deno test --allow-env"
+  },
+  "version": "0.1.0",
+  "exports": "./main.ts",
+  "publish": {
+    "include": ["LICENSE", "README.md", "main.ts"]
+  },
+  "imports": {
+    "@aws-sdk/client-kms": "npm:@aws-sdk/client-kms@^3.1127.0",
+    "@std/assert": "jsr:@std/assert@^1.0.19",
+    "@std/encoding": "jsr:@std/encoding@^1.0.11"
+  }
+}
