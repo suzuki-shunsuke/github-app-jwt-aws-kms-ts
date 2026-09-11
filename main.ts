@@ -60,10 +60,33 @@ export type Signer = {
   send(command: SignCommand): Promise<SignCommandOutput>;
 };
 
+/**
+ * This function reads the region out of a KMS key ARN.
+ *
+ * An ARN looks like arn:aws:kms:<region>:<account>:key/<id>, so a caller
+ * passing one has already said which region the key is in. An alias name or a
+ * bare key id carries none, and an empty string is returned.
+ */
+export const regionFromKeyId = (keyId: string): string => {
+  if (!keyId.startsWith("arn:")) {
+    return "";
+  }
+  return keyId.split(":")[3] ?? "";
+};
+
 /** Inputs of the createJwt function. */
 export type Inputs = {
   /** A key id, a key ARN, an alias name, or an alias ARN of a KMS key. */
   keyId: string;
+  /**
+   * The AWS region of the key.
+   *
+   * If it's omitted, the region is read from keyId when that's an ARN.
+   * Failing that, the AWS SDK resolves it as it normally would, from
+   * AWS_REGION, ~/.aws/config and so on.
+   * It's ignored when client is given, as that client already has one.
+   */
+  region?: string;
   /**
    * A KMS client.
    *
@@ -112,7 +135,11 @@ type Cache = {
  * a KMS Sign API call isn't made for every request.
  */
 export const createJwt = (inputs: Inputs): CreateJwt => {
-  const client: Signer = inputs.client ?? new KMSClient({});
+  const client: Signer = inputs.client ??
+    new KMSClient({
+      // Undefined leaves the region to the AWS SDK's own resolution.
+      region: inputs.region || regionFromKeyId(inputs.keyId) || undefined,
+    });
   let cache: Cache | undefined;
 
   return async (appId: string | number, timeDifference?: number) => {
