@@ -1,9 +1,12 @@
 import { assertEquals, assertRejects } from "@std/assert";
 import type { SignCommand, SignCommandOutput } from "@aws-sdk/client-kms";
 import { decodeBase64Url } from "@std/encoding/base64url";
-import { createJwt, type Signer } from "./main.ts";
+import { createJwt, regionFromKeyId, type Signer } from "./main.ts";
 
 const decoder = new TextDecoder();
+
+const arnKeyId =
+  "arn:aws:kms:ap-northeast-1:123456789012:key/00000000-0000-0000-0000-000000000000";
 
 type SignInput = SignCommand["input"];
 
@@ -157,4 +160,24 @@ Deno.test("the signed JSON Web Token is verifiable with the public key", async (
     ),
     true,
   );
+});
+
+Deno.test("regionFromKeyId reads the region out of a key ARN", () => {
+  assertEquals(regionFromKeyId(arnKeyId), "ap-northeast-1");
+});
+
+Deno.test("regionFromKeyId reads the region out of an alias ARN", () => {
+  assertEquals(
+    regionFromKeyId("arn:aws:kms:us-east-1:123456789012:alias/example"),
+    "us-east-1",
+  );
+});
+
+Deno.test("regionFromKeyId returns nothing for a bare key id", () => {
+  assertEquals(regionFromKeyId("00000000-0000-0000-0000-000000000000"), "");
+});
+
+Deno.test("regionFromKeyId returns nothing for an alias name", () => {
+  // Without a region the AWS SDK resolves one as it normally would.
+  assertEquals(regionFromKeyId("alias/example"), "");
 });

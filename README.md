@@ -51,6 +51,20 @@ algorithm GitHub requires.
 
 The caller needs the `kms:Sign` permission on the key.
 
+## The AWS region
+
+A key ARN carries its region, so passing `keyId` as an ARN is enough and nothing
+else needs setting. For an alias name or a bare key id, pass `region`, or leave
+it to the AWS SDK, which resolves `AWS_REGION` and `~/.aws/config` as it
+normally does.
+
+```ts
+const sign = createJwt({ keyId: "alias/example", region: "us-east-1" });
+```
+
+`region` is ignored when you pass your own `client`, since that client already
+has one.
+
 ## AWS client
 
 By default a `KMSClient` is created internally, so a region and credentials are
