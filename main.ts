@@ -7,6 +7,11 @@
  * {@link https://jsr.io/@suzuki-shunsuke/github-app-token | @suzuki-shunsuke/github-app-token}'s
  * create function instead of a private key.
  *
+ * Only the KMS Sign API is called, over HTTPS with a SigV4 signature, so the
+ * AWS SDK isn't needed. That matters for a GitHub Action, where the SDK is
+ * bundled into the action and every job downloads it: @aws-sdk/client-kms adds
+ * over a megabyte to a bundle to make one API call.
+ *
  * @example
  * ```ts
  * import { create } from "@suzuki-shunsuke/github-app-token";
@@ -24,11 +29,9 @@
  * @module
  */
 
-import {
-  KMSClient,
-  SignCommand,
-  type SignCommandOutput,
-} from "@aws-sdk/client-kms";
+import process from "node:process";
+import { AwsClient } from "aws4fetch";
+import { decodeBase64, encodeBase64 } from "@std/encoding/base64";
 import { encodeBase64Url } from "@std/encoding/base64url";
 
 /** A signed JSON Web Token and its expiration date. */
@@ -50,14 +53,60 @@ export type CreateJwt = (
   timeDifference?: number,
 ) => Promise<Jwt>;
 
+/** AWS credentials allowed to call kms:Sign on the key. */
+export type Credentials = {
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;
+};
+
 /**
- * The part of KMSClient which this module uses.
+ * Credentials, or a function returning them.
  *
- * A KMSClient satisfies this type, so you can simply pass one.
- * It's declared structurally so that you can pass a stub in tests.
+ * A function is called once per Sign call, so a provider that refreshes an
+ * expiring session works. @suzuki-shunsuke/actions-aws-oidc returns one that
+ * assumes an IAM role with the GitHub OIDC token.
  */
-export type Signer = {
-  send(command: SignCommand): Promise<SignCommandOutput>;
+export type CredentialsProvider =
+  | Credentials
+  | (() => Credentials | Promise<Credentials>);
+
+/**
+ * The part of fetch which this module uses.
+ *
+ * globalThis.fetch satisfies this type, so it's only worth passing to stub the
+ * KMS API in tests.
+ */
+export type Fetch = (
+  input: string,
+  init?: RequestInit,
+) => Promise<Response>;
+
+/** Inputs of the createJwt function. */
+export type Inputs = {
+  /** A key id, a key ARN, an alias name, or an alias ARN of a KMS key. */
+  keyId: string;
+  /**
+   * The AWS region of the key.
+   *
+   * If it's omitted, the region is read from keyId when that's an ARN, and
+   * failing that from AWS_REGION or AWS_DEFAULT_REGION.
+   * An alias name or a bare key id carries no region, so one of those has to
+   * supply it.
+   */
+  region?: string;
+  /**
+   * AWS credentials, or a function returning them.
+   *
+   * If it's omitted, they're read from AWS_ACCESS_KEY_ID,
+   * AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN, which is what
+   * aws-actions/configure-aws-credentials exports.
+   * Pass them explicitly for any other source, such as an AWS SDK credential
+   * provider or an IAM role assumed with an OIDC token.
+   */
+  credentials?: CredentialsProvider;
+  /** It defaults to globalThis.fetch, and exists so tests can stub it. */
+  fetch?: Fetch;
 };
 
 /**
@@ -74,27 +123,38 @@ export const regionFromKeyId = (keyId: string): string => {
   return keyId.split(":")[3] ?? "";
 };
 
-/** Inputs of the createJwt function. */
-export type Inputs = {
-  /** A key id, a key ARN, an alias name, or an alias ARN of a KMS key. */
-  keyId: string;
-  /**
-   * The AWS region of the key.
-   *
-   * If it's omitted, the region is read from keyId when that's an ARN.
-   * Failing that, the AWS SDK resolves it as it normally would, from
-   * AWS_REGION, ~/.aws/config and so on.
-   * It's ignored when client is given, as that client already has one.
-   */
-  region?: string;
-  /**
-   * A KMS client.
-   *
-   * If it's omitted, a new KMSClient is created.
-   * Then a region and credentials are resolved from the standard AWS
-   * environment variables.
-   */
-  client?: Signer;
+const resolveRegion = (inputs: Inputs): string => {
+  const region = inputs.region || regionFromKeyId(inputs.keyId) ||
+    process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION;
+  if (!region) {
+    throw new Error(
+      "the AWS region is unknown: pass region, pass keyId as an ARN, or set AWS_REGION",
+    );
+  }
+  return region;
+};
+
+const resolveCredentials = async (
+  credentials: CredentialsProvider | undefined,
+): Promise<Credentials> => {
+  if (typeof credentials === "function") {
+    return await credentials();
+  }
+  if (credentials) {
+    return credentials;
+  }
+  const accessKeyId = process.env.AWS_ACCESS_KEY_ID;
+  const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
+  if (!accessKeyId || !secretAccessKey) {
+    throw new Error(
+      "no AWS credentials: pass credentials, or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY",
+    );
+  }
+  return {
+    accessKeyId,
+    secretAccessKey,
+    sessionToken: process.env.AWS_SESSION_TOKEN,
+  };
 };
 
 /**
@@ -126,6 +186,51 @@ type Cache = {
 };
 
 /**
+ * This function calls the KMS Sign API and returns the raw signature.
+ *
+ * KMS speaks JSON over HTTPS, so the request is the operation name in the
+ * X-Amz-Target header and a JSON body, signed with SigV4 by aws4fetch.
+ */
+const sign = async (
+  inputs: Inputs,
+  region: string,
+  message: Uint8Array,
+): Promise<Uint8Array> => {
+  const credentials = await resolveCredentials(inputs.credentials);
+  const client = new AwsClient({ ...credentials, service: "kms", region });
+  const request = await client.sign(`https://kms.${region}.amazonaws.com/`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-amz-json-1.1",
+      "x-amz-target": "TrentService.Sign",
+    },
+    body: JSON.stringify({
+      KeyId: inputs.keyId,
+      Message: encodeBase64(message),
+      MessageType: "RAW",
+      // GitHub requires RS256, which is RSASSA-PKCS1-v1_5 with SHA-256.
+      SigningAlgorithm: "RSASSA_PKCS1_V1_5_SHA_256",
+    }),
+  });
+  const doFetch = inputs.fetch ?? globalThis.fetch;
+  const response = await doFetch(request.url, {
+    method: request.method,
+    headers: request.headers,
+    body: await request.text(),
+  });
+  if (!response.ok) {
+    throw new Error(
+      `AWS KMS returned ${response.status}: ${await response.text()}`,
+    );
+  }
+  const { Signature } = await response.json() as { Signature?: string };
+  if (!Signature) {
+    throw new Error("AWS KMS returned no signature");
+  }
+  return decodeBase64(Signature);
+};
+
+/**
  * This function creates a callback signing GitHub App JSON Web Tokens with AWS
  * KMS.
  *
@@ -135,11 +240,7 @@ type Cache = {
  * a KMS Sign API call isn't made for every request.
  */
 export const createJwt = (inputs: Inputs): CreateJwt => {
-  const client: Signer = inputs.client ??
-    new KMSClient({
-      // Undefined leaves the region to the AWS SDK's own resolution.
-      region: inputs.region || regionFromKeyId(inputs.keyId) || undefined,
-    });
+  const region = resolveRegion(inputs);
   let cache: Cache | undefined;
 
   return async (appId: string | number, timeDifference?: number) => {
@@ -164,23 +265,12 @@ export const createJwt = (inputs: Inputs): CreateJwt => {
     })));
     const message = `${encodedHeader}.${encodedPayload}`;
 
-    const output = await client.send(
-      new SignCommand({
-        KeyId: inputs.keyId,
-        Message: encoder.encode(message),
-        MessageType: "RAW",
-        // GitHub requires RS256, which is RSASSA-PKCS1-v1_5 with SHA-256.
-        SigningAlgorithm: "RSASSA_PKCS1_V1_5_SHA_256",
-      }),
-    );
-    if (!output.Signature) {
-      throw new Error("AWS KMS returned no signature");
-    }
-
     // AWS KMS returns a raw PKCS #1 signature for RSA keys, which is exactly
     // what a JSON Web Token signature is. Only ECDSA signatures are DER encoded.
+    const signature = await sign(inputs, region, encoder.encode(message));
+
     const jwt = {
-      jwt: `${message}.${encodeBase64Url(output.Signature)}`,
+      jwt: `${message}.${encodeBase64Url(signature)}`,
       expiresAt: new Date(exp * 1000).toISOString(),
     };
     if (!timeDifference) {

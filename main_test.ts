@@ -1,29 +1,60 @@
-import { assertEquals, assertRejects } from "@std/assert";
-import type { SignCommand, SignCommandOutput } from "@aws-sdk/client-kms";
+import { assertEquals, assertRejects, assertStringIncludes } from "@std/assert";
+import { decodeBase64, encodeBase64 } from "@std/encoding/base64";
 import { decodeBase64Url } from "@std/encoding/base64url";
-import { createJwt, regionFromKeyId, type Signer } from "./main.ts";
+import { createJwt, type Fetch, regionFromKeyId } from "./main.ts";
 
 const decoder = new TextDecoder();
 
 const arnKeyId =
   "arn:aws:kms:ap-northeast-1:123456789012:key/00000000-0000-0000-0000-000000000000";
 
-type SignInput = SignCommand["input"];
+const credentials = {
+  accessKeyId: "AKIAIOSFODNN7EXAMPLE",
+  secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+};
 
-/** This class records Sign commands and returns a canned signature. */
-class FakeSigner implements Signer {
-  readonly inputs: SignInput[] = [];
+type SignRequest = {
+  url: string;
+  target: string | null;
+  authorization: string | null;
+  body: {
+    KeyId: string;
+    Message: string;
+    MessageType: string;
+    SigningAlgorithm: string;
+  };
+};
 
-  constructor(private readonly signature: Uint8Array | undefined) {}
+/** This records the KMS Sign requests and returns a canned signature. */
+class FakeKMS {
+  readonly requests: SignRequest[] = [];
 
-  send(command: SignCommand): Promise<SignCommandOutput> {
-    this.inputs.push(command.input);
-    return Promise.resolve({
-      $metadata: {},
-      Signature: this.signature,
+  constructor(
+    private readonly respond: (message: Uint8Array) => Promise<Response>,
+  ) {}
+
+  readonly fetch: Fetch = async (url, init) => {
+    const headers = new Headers(init?.headers);
+    const body = JSON.parse(init?.body as string);
+    this.requests.push({
+      url,
+      target: headers.get("x-amz-target"),
+      authorization: headers.get("authorization"),
+      body,
     });
-  }
+    return await this.respond(decodeBase64(body.Message));
+  };
 }
+
+const signatureOf = (signature: Uint8Array | undefined) => () =>
+  Promise.resolve(
+    new Response(
+      JSON.stringify(
+        signature ? { Signature: encodeBase64(signature) } : {},
+      ),
+      { status: 200 },
+    ),
+  );
 
 const parseJwt = (jwt: string) => {
   const [header, payload, signature] = jwt.split(".");
@@ -36,15 +67,26 @@ const parseJwt = (jwt: string) => {
 
 Deno.test("createJwt signs a GitHub App JSON Web Token with AWS KMS", async () => {
   const signature = new Uint8Array([251, 255, 190, 0, 1]);
-  const client = new FakeSigner(signature);
+  const kms = new FakeKMS(signatureOf(signature));
   const before = Math.floor(Date.now() / 1000);
-  const token = await createJwt({ keyId: "test-key", client })("123456");
+  const token = await createJwt({
+    keyId: arnKeyId,
+    credentials,
+    fetch: kms.fetch,
+  })("123456");
   const after = Math.floor(Date.now() / 1000);
 
-  assertEquals(client.inputs.length, 1);
-  assertEquals(client.inputs[0].KeyId, "test-key");
-  assertEquals(client.inputs[0].MessageType, "RAW");
-  assertEquals(client.inputs[0].SigningAlgorithm, "RSASSA_PKCS1_V1_5_SHA_256");
+  assertEquals(kms.requests.length, 1);
+  const request = kms.requests[0];
+  assertEquals(request.body.KeyId, arnKeyId);
+  assertEquals(request.body.MessageType, "RAW");
+  assertEquals(request.body.SigningAlgorithm, "RSASSA_PKCS1_V1_5_SHA_256");
+  assertEquals(request.target, "TrentService.Sign");
+
+  // The endpoint and the signature scope both follow the key ARN's region.
+  assertEquals(request.url, "https://kms.ap-northeast-1.amazonaws.com/");
+  assertStringIncludes(request.authorization ?? "", "AWS4-HMAC-SHA256");
+  assertStringIncludes(request.authorization ?? "", "/ap-northeast-1/kms/");
 
   const parsed = parseJwt(token.jwt);
   assertEquals(parsed.header, { alg: "RS256", typ: "JWT" });
@@ -63,41 +105,41 @@ Deno.test("createJwt signs a GitHub App JSON Web Token with AWS KMS", async () =
 
   // AWS KMS signs the header and the payload joined by a dot.
   assertEquals(
-    decoder.decode(client.inputs[0].Message),
+    decoder.decode(decodeBase64(request.body.Message)),
     token.jwt.split(".").slice(0, 2).join("."),
   );
 });
 
 Deno.test("createJwt caches a JSON Web Token", async () => {
-  const client = new FakeSigner(new Uint8Array([1]));
-  const sign = createJwt({ keyId: "test-key", client });
+  const kms = new FakeKMS(signatureOf(new Uint8Array([1])));
+  const sign = createJwt({ keyId: arnKeyId, credentials, fetch: kms.fetch });
 
   const first = await sign("123456");
   const second = await sign("123456");
 
-  assertEquals(client.inputs.length, 1);
+  assertEquals(kms.requests.length, 1);
   assertEquals(second, first);
 });
 
 Deno.test("createJwt doesn't reuse a cached token for another app", async () => {
-  const client = new FakeSigner(new Uint8Array([1]));
-  const sign = createJwt({ keyId: "test-key", client });
+  const kms = new FakeKMS(signatureOf(new Uint8Array([1])));
+  const sign = createJwt({ keyId: arnKeyId, credentials, fetch: kms.fetch });
 
   await sign("123456");
   const token = await sign("654321");
 
-  assertEquals(client.inputs.length, 2);
+  assertEquals(kms.requests.length, 2);
   assertEquals(parseJwt(token.jwt).payload.iss, "654321");
 });
 
 Deno.test("createJwt applies timeDifference and skips the cache", async () => {
-  const client = new FakeSigner(new Uint8Array([1]));
-  const sign = createJwt({ keyId: "test-key", client });
+  const kms = new FakeKMS(signatureOf(new Uint8Array([1])));
+  const sign = createJwt({ keyId: arnKeyId, credentials, fetch: kms.fetch });
 
   const first = await sign("123456");
   const second = await sign("123456", 3600);
 
-  assertEquals(client.inputs.length, 2);
+  assertEquals(kms.requests.length, 2);
   assertEquals(
     parseJwt(second.jwt).payload.iat - parseJwt(first.jwt).payload.iat,
     3600,
@@ -105,20 +147,89 @@ Deno.test("createJwt applies timeDifference and skips the cache", async () => {
 
   // A token created with a clock skew isn't cached either.
   await sign("123456");
-  assertEquals(client.inputs.length, 3);
+  assertEquals(kms.requests.length, 3);
+});
+
+Deno.test("createJwt calls the credentials function for every signature", async () => {
+  const kms = new FakeKMS(signatureOf(new Uint8Array([1])));
+  let calls = 0;
+  const sign = createJwt({
+    keyId: arnKeyId,
+    fetch: kms.fetch,
+    credentials: () => {
+      calls++;
+      return credentials;
+    },
+  });
+
+  await sign("123456");
+  await sign("654321");
+
+  // A cached token needs no signature, so it needs no credentials either.
+  await sign("654321");
+
+  assertEquals(calls, 2);
+});
+
+Deno.test("createJwt sends the session token of temporary credentials", async () => {
+  const kms = new FakeKMS(signatureOf(new Uint8Array([1])));
+  await createJwt({
+    keyId: arnKeyId,
+    fetch: kms.fetch,
+    credentials: { ...credentials, sessionToken: "session-token" },
+  })("123456");
+
+  assertStringIncludes(
+    kms.requests[0].authorization ?? "",
+    "x-amz-security-token",
+  );
 });
 
 Deno.test("createJwt fails if AWS KMS returns no signature", async () => {
-  const sign = createJwt({
-    keyId: "test-key",
-    client: new FakeSigner(undefined),
-  });
+  const kms = new FakeKMS(signatureOf(undefined));
+  const sign = createJwt({ keyId: arnKeyId, credentials, fetch: kms.fetch });
 
   await assertRejects(
     () => sign("123456"),
     Error,
     "AWS KMS returned no signature",
   );
+});
+
+Deno.test("createJwt reports what AWS KMS rejected", async () => {
+  const kms = new FakeKMS(() =>
+    Promise.resolve(
+      new Response('{"__type":"AccessDeniedException"}', { status: 400 }),
+    )
+  );
+  const sign = createJwt({ keyId: arnKeyId, credentials, fetch: kms.fetch });
+
+  await assertRejects(
+    () => sign("123456"),
+    Error,
+    'AWS KMS returned 400: {"__type":"AccessDeniedException"}',
+  );
+});
+
+Deno.test("createJwt fails if the region can't be worked out", () => {
+  assertEquals(
+    (() => {
+      try {
+        createJwt({ keyId: "alias/example", credentials });
+        return "";
+      } catch (e) {
+        return (e as Error).message;
+      }
+    })().includes("the AWS region is unknown"),
+    true,
+  );
+});
+
+Deno.test("createJwt fails if there are no credentials", async () => {
+  const kms = new FakeKMS(signatureOf(new Uint8Array([1])));
+  const sign = createJwt({ keyId: arnKeyId, fetch: kms.fetch });
+
+  await assertRejects(() => sign("123456"), Error, "no AWS credentials");
 });
 
 Deno.test("the signed JSON Web Token is verifiable with the public key", async () => {
@@ -135,20 +246,28 @@ Deno.test("the signed JSON Web Token is verifiable with the public key", async (
 
   // AWS KMS returns a raw PKCS #1 signature for RSA keys, which is what
   // SubtleCrypto returns too.
-  const client: Signer = {
-    send: async (command: SignCommand) => ({
-      $metadata: {},
-      Signature: new Uint8Array(
-        await crypto.subtle.sign(
-          algorithm.name,
-          key.privateKey,
-          command.input.Message as Uint8Array<ArrayBuffer>,
+  const kms = new FakeKMS(async (message) =>
+    new Response(
+      JSON.stringify({
+        Signature: encodeBase64(
+          new Uint8Array(
+            await crypto.subtle.sign(
+              algorithm.name,
+              key.privateKey,
+              message as Uint8Array<ArrayBuffer>,
+            ),
+          ),
         ),
-      ),
-    }),
-  };
+      }),
+      { status: 200 },
+    )
+  );
 
-  const token = await createJwt({ keyId: "test-key", client })("123456");
+  const token = await createJwt({
+    keyId: arnKeyId,
+    credentials,
+    fetch: kms.fetch,
+  })("123456");
   const [header, payload, signature] = token.jwt.split(".");
 
   assertEquals(
@@ -178,6 +297,6 @@ Deno.test("regionFromKeyId returns nothing for a bare key id", () => {
 });
 
 Deno.test("regionFromKeyId returns nothing for an alias name", () => {
-  // Without a region the AWS SDK resolves one as it normally would.
+  // The region then comes from the region input or AWS_REGION.
   assertEquals(regionFromKeyId("alias/example"), "");
 });

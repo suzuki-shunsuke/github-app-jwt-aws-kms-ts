@@ -12,6 +12,11 @@ Tokens through the KMS Sign API instead, and returns a callback which
 and [@octokit/auth-app](https://github.com/octokit/auth-app.js) accept in place
 of a private key.
 
+Only the KMS Sign API is called, over HTTPS with a SigV4 signature, so the AWS
+SDK isn't a dependency. That matters most in a GitHub Action, where the action
+is bundled and every job downloads it: `@aws-sdk/client-kms` adds over a
+megabyte to a bundle in order to make one API call.
+
 ## Example
 
 ```ts
@@ -54,37 +59,56 @@ The caller needs the `kms:Sign` permission on the key.
 ## The AWS region
 
 A key ARN carries its region, so passing `keyId` as an ARN is enough and nothing
-else needs setting. For an alias name or a bare key id, pass `region`, or leave
-it to the AWS SDK, which resolves `AWS_REGION` and `~/.aws/config` as it
-normally does.
+else needs setting. An alias name or a bare key id carries none, so pass
+`region`, or set `AWS_REGION` or `AWS_DEFAULT_REGION`. `createJwt` throws
+straight away when it can't work one out, rather than failing at the first
+signature.
 
 ```ts
 const sign = createJwt({ keyId: "alias/example", region: "us-east-1" });
 ```
 
-`region` is ignored when you pass your own `client`, since that client already
-has one.
+## Credentials
 
-## AWS client
+By default credentials are read from `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`, which is what
+`aws-actions/configure-aws-credentials` exports on GitHub Actions.
 
-By default a `KMSClient` is created internally, so a region and credentials are
-resolved from the standard AWS environment variables. On GitHub Actions,
-`aws-actions/configure-aws-credentials` sets them up.
-
-You can also pass your own client.
+Pass `credentials` for any other source. A function is called once per Sign API
+call, so a provider that refreshes an expiring session works, and a cached token
+costs no call and therefore no credentials.
 
 ```ts
-import { KMSClient } from "@aws-sdk/client-kms";
-import { createJwt } from "@suzuki-shunsuke/github-app-jwt-aws-kms";
+import { credentials } from "@suzuki-shunsuke/actions-aws-oidc";
 
+// Assume an IAM role with the GitHub OIDC token instead of exporting
+// credentials into the job.
 const sign = createJwt({
   keyId: "...",
-  client: new KMSClient({ region: "us-east-1" }),
+  credentials: () => credentials({ roleArn: "..." })(),
 });
 ```
 
-The `client` option is typed structurally as `Signer`, so a stub is accepted in
-tests as well.
+An AWS SDK credential provider fits the same shape, so the full credential chain
+is still available to anyone who wants it.
+
+```ts
+import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
+
+const sign = createJwt({ keyId: "...", credentials: fromNodeProviderChain() });
+```
+
+## Testing
+
+`fetch` is an input, so the KMS API can be stubbed without a network.
+
+```ts
+const sign = createJwt({
+  keyId: "...",
+  credentials: { accessKeyId: "...", secretAccessKey: "..." },
+  fetch: (url, init) => Promise.resolve(new Response("...")),
+});
+```
 
 ## Caching
 
@@ -97,5 +121,6 @@ cached one is out of date in that case.
 
 ## Permissions
 
-Deno needs `--allow-env`, `--allow-net` and `--allow-sys` to call AWS KMS.
-`--allow-read` is also needed if credentials come from `~/.aws`.
+Deno needs `--allow-net` to call AWS KMS, and `--allow-env` to read the region
+and the credentials from environment variables. Neither is needed when `region`,
+`credentials` and `fetch` are all passed in.
