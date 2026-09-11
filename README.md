@@ -1,7 +1,6 @@
 # github-app-jwt-aws-kms-ts
 
 [![JSR](https://jsr.io/badges/@suzuki-shunsuke/github-app-jwt-aws-kms)](https://jsr.io/@suzuki-shunsuke/github-app-jwt-aws-kms)
-[![License](http://img.shields.io/badge/license-mit-blue.svg?style=flat-square)](https://raw.githubusercontent.com/suzuki-shunsuke/github-app-jwt-aws-kms-ts/main/LICENSE)
 
 github-app-jwt-aws-kms-ts is a JSR package to sign GitHub App JSON Web Tokens
 with AWS KMS.
@@ -86,7 +85,3 @@ cached one is out of date in that case.
 
 Deno needs `--allow-env`, `--allow-net` and `--allow-sys` to call AWS KMS.
 `--allow-read` is also needed if credentials come from `~/.aws`.
-
-## LICENSE
-
-[MIT](LICENSE)
